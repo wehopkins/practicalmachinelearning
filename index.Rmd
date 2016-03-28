@@ -1,0 +1,469 @@
+---
+title: "Recognizing Correctness of Exercise Movement."
+author: "WE Hopkins"
+date: "March 21, 2016"
+output: html_document
+---
+
+```{r prologue, echo=FALSE,results='hide',message=FALSE,warning=FALSE}
+# load knitr to be able to set options...
+require(knitr,quietly=TRUE,warn.conflicts=FALSE)
+opts_chunk$set(echo=FALSE,warning=FALSE,message=FALSE,comment="",width=100)
+
+# drop the starts - adds extra lines of output
+options(show.signif.stars=FALSE,digits=10)
+```
+
+```{r load_libraries}
+require(ada)
+require(penalizedLDA)
+require(MASS)
+require(party)
+require(earth)
+require(mda)
+require(pls)
+require(randomForest)
+require(klaR)
+require(corrplot)
+require(caret)
+require(ggplot2)
+require(readr)
+require(plyr)
+require(dplyr)
+```
+
+
+```{r downloadData, results='hide'}
+training.file <- "pml-training.csv"
+if (!file.exists(training.file)) {
+  training.data.url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+  download.file(training.data.url,destfile=training.file)
+}
+testing.file <- "pml-testing.csv"
+if (!file.exists(testing.file)) {
+  testing.data.url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+  download.file(testing.data.url,destfile=testing.file)
+}
+```
+
+# Summary
+
+The research question is whether proper form during exercise can be determined from personal sensor data.
+In this particular work, it is about form during a unilateral bicep curl with a dumbbell.
+The training data from a 
+[previous study](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf) was
+provided along with instructions to use any of the provided variables and a set of test data from
+which to determine whether the associated movement followed one of the classes of form
+(identified by the classe variable as A, B, C, D, or E).
+
+A number of models performed very well (rpart, ctree, knn), but random forest (rf) did the best with
+a median accuracy of 99.9%
+on 10-fold cross validation.
+This result, however, is not likely to generalize well since the variable most important (by 100.0 vs. 50.8 for the next most important) was raw_timestamp_part_1.
+
+```{r}
+train.raw.df <- read.csv(training.file,na.strings=c("","NA","#DIV/0!"))
+# eliminate row number column
+train.raw.df$X <- NULL
+test.raw.df <- read.csv(testing.file,na.strings=c("","NA","#DIV/0!"))
+# eliminate row number column
+test.raw.df$X <- NULL
+
+# locate columns in test set that are ALL na; remove those columns from test and train data sets
+test.na <- vapply(test.raw.df,FUN.VALUE=logical(1),FUN=function(x) all(is.na(x)))
+test.df <- test.raw.df[,!test.na]
+train.df <- train.raw.df[,!test.na]
+```
+
+# Preliminary Feature Selection
+
+The test data set provided for the project defines what is available for the basis of making predictions
+even though the training data set had all the same variables.
+It consists of 20 rows of observations, made up of 159 variables (or features).
+Of those 159 variables, 100 had no values (equal to "NA"),
+effectively making those variables unavailable for use in the models (it turns out that they were
+all the "summary" variables - statistics based on time windows of the actual sensor measurements).
+
+Thus, the original data sets were immediately reduced from 159 variables to 59.
+Incidentally, many of those eliminated variables had bad values in the training data set; being
+able to eliminate them greatly reduced the amount of data cleaning needed.
+
+
+# Preprocessing
+
+Many of the machine learning models are sensitive to various characteristics of the
+predictor variables.
+
+```{r feature_selection}
+
+
+# remove features specific to a particular movement collection and/or the summary features left
+# out of the test data set
+time_cols <- c("raw_timestamp_part_1","raw_timestamp_part_2","cvtd_timestamp","new_window","num_window")
+del_time_cols <- paste0("-",time_cols)
+train.no.tc.df <- train.df%>%dplyr::select_(.dots=del_time_cols)
+test.no.tc.df <- test.df%>%dplyr::select_(.dots=del_time_cols)
+
+# check for near zero variance
+nzv.indices <- nearZeroVar(train.df)
+if (length(nzv.indices>0)) {
+  nzv_cols <- names(train.df)[nzv.indices]
+  del_nzv_cols <- paste0("-",nzv_cols)
+}
+
+# check for collinearity
+numeric_indicies <- which(vapply(train.df,FUN.VALUE = logical(1),FUN=is.numeric))
+numeric_cols <- names(train.df)[numeric_indicies]
+colinear.indices <- findCorrelation(cor(train.df[numeric_cols]))
+colinear.names <- names(train.df[numeric_cols])[colinear.indices]
+del_colinear_cols <- paste0("-",colinear.names)
+
+```
+
+## Near Zero Variance
+
+There are those models that need to avoid variables with near zero variance (nzv).
+Caret provides a function, nearZeroVar(), which identifies them.
+In the training data set, `r nzv_cols` is a near zero variance variable.
+
+For all the observations for user_name=="adelmo", the values of roll_forearm, pitch_forearm, and yaw_forearm
+were set to zero, making them nzv in the context of that user, but in the context of the rest of
+the users, it wasn't a problem and could be useful given the test data set.
+
+Similarly for user_name=="jeremy" and roll_arm, yaw_arm, and pitch_arm.
+
+## Collinearity
+
+The other main problem for some variables is collinearity.
+Caret provides the function, findCorrelation(), to locate variables to leave out
+when collinearity is an issue.
+In the training data, it is the following variables: `r colinear.names`.
+Here is a plot (using corrplot::corrplot()) providing a quick view of groupings of collinear variables.
+
+```{r collinear_plot}
+corrplot::corrplot(cor(train.df[numeric_cols]),order="hclust",tl.cex=0.5)
+```
+
+
+# Model Strategy
+
+Each model was trained using 10-fold cross validation.
+To facilitate pair-wise statistical comparisons via resample(), the same random seed is set prior to
+training each model.
+
+Initially, models were built using a subset of the training data so as to more quickly determine
+issues with the data or the model parameters.
+
+Also, on a per-model basis, values for tunable model parameters were adjusted.
+Each model was originally run with the default set of tunable parameter values, then
+the values were explicity set using the train() function's tuneGrid parameter to move the range
+to where accuracy is maximized.
+
+
+```{r train_spec}
+# there are plenty of observations - go with standard 10-fold cross-validation
+train_control <- trainControl(method="cv",
+                              number=10
+)
+
+
+```
+
+
+```{r fda, eval=FALSE}
+
+set.seed(20160323)
+mdl_fda <- train(form=classe~.,
+                 data=train.df%>%select(classe,raw_timestamp_part_1,user_name),
+                 method="fda",
+                 tuneGrid=data.frame(degree=2,nprune=c(15,25)),
+                 trControl=train_control)
+
+```
+
+```{r logistic, eval=FALSE}
+# Doesn't work...
+  # glm models can only use 2-class outcomes
+
+set.seed(20160323)
+mdl_glm <- train(form=classe~.,
+                 data=train.df%>%
+                   select_(.dots=del_time_cols[-1])%>%
+                   select_(.dots=paste0("-",colinear.names)),
+                 method="glm",
+                 preProcess=c("center","scale"),
+                 trControl=train_control)
+```
+
+```{r PenalizedLDA,cache=TRUE}
+
+set.seed(20160323)
+mdl_plda <- train(form=classe~.,
+                 data=train.df%>%select_(.dots=del_nzv_cols),
+                 method="PenalizedLDA",
+                 tuneGrid=data.frame(lambda=c(1e-2,1e-1,2e-1,3e-1),K=4),
+                 trControl=train_control)
+
+```
+
+```{r pls, cache=TRUE}
+
+set.seed(20160323)
+mdl_pls <- train(form=classe~.,
+                 data=train.df,
+                 method="pls",
+                 preProcess=c("center","scale"),
+                 tuneGrid=data.frame(ncomp=seq(48,54,by=1)),
+                 trControl=train_control)
+
+
+```
+
+
+```{r tree, cache=TRUE}
+
+set.seed(20160323)
+mdl_rpart <- train(form=classe~.,
+                 data=train.df,
+                 method="rpart",
+                 tuneGrid=data.frame(cp=seq(0.00002,0.0002,by=0.00002)),
+                 trControl=train_control)
+
+```
+
+Here is the output creating the rpart model:
+```{r rpart_tuning}
+mdl_rpart
+```
+
+Note that each model provides the standard deviation for the performance metrics, based on the
+results of running, in this case, 10 fold cross-validation.
+
+Caret overrides the plot() function to provide a graph of the accuracy vs. tunable parameter value:
+```{r rpart_plot}
+plot(mdl_rpart)
+```
+
+
+```{r conditional_tree, cache=TRUE}
+
+# Very high performance; >94% for single user, >89% for all users
+
+set.seed(20160323)
+mdl_ctree <- train(form=classe~.,
+                 data=train.df,
+                 method="ctree",
+                 trControl=train_control)
+
+```
+
+```{r lda, cache=TRUE}
+# linear discrimant analysis
+
+# Something is wrong; all the Accuracy metric values are missing:
+#     variables 40 41 42 appear to be constant within groups
+
+set.seed(20160323)
+mdl_lda <- train(form=classe~.,
+                 data=train.df%>%select_(.dots=del_nzv_cols)%>%
+                   select_(.dots=del_colinear_cols),
+                 method="lda",
+                 trControl=train_control)
+
+```
+
+```{r knn, cache=TRUE}
+
+set.seed(20160323)
+mdl_knn <- train(form=classe~.,
+                 data=train.df%>%select_(.dots=del_nzv_cols),
+                 method="knn",
+                 tuneGrid=data.frame(k=1:5),
+                 preProcess=c("center","scale"),
+                 trControl=train_control)
+
+# seriously accurate for single user - 99.6%
+# Cross-Validated (10 fold) Confusion Matrix 
+# 
+# (entries are percentages of table totals)
+#  
+#           Reference
+# Prediction    A    B    C    D    E
+#          A 29.9  0.1  0.0  0.0  0.0
+#          B  0.0 19.9  0.0  0.0  0.0
+#          C  0.0  0.0 19.2  0.2  0.0
+#          D  0.0  0.0  0.1 13.1  0.0
+#          E  0.0  0.0  0.0  0.0 17.6
+
+         
+```
+
+
+```{r ada, eval=FALSE, cache=TRUE}
+# Boosted classification tree - can't use:
+#  Currently this procedure can not directly handle > 2 class response
+
+set.seed(20160323)
+mdl_ada <- train(form=classe~.,
+                 data=train.df,
+                 method="ada",
+                 metric="Kappa",
+                 tuneGrid=data.frame(iter=20,maxdepth=2,nu=.1),
+                 trControl=train_control)
+
+```
+
+Some model parameters are not tunable in the sense that multiple values are evaluated via
+cross-validation, but
+can determine important model behavior.
+For example, random forest (rf) take a notoriously long time to run on most PCs (it does have an option
+to run in parallel, but not on Windows).
+In this case, I tried a much reduced value for the number of trees to build: 50 instead of the default
+500.
+It made it feasible to run and provided the best accuracy of all the models (median accuracy was
+99.9% during cross validation).
+
+```{r rf,cache=TRUE}
+
+set.seed(20160323)
+# long run, but limiting number of trees made it acceptable to run... and it was PERFECT
+mdl_rf <- train(form=classe~.,
+                data=train.df,
+                method="rf",
+                ntree=50,
+                tuneGrid=data.frame(mtry=c(5,10)),
+                trControl=train_control)
+
+# Cross-Validated (10 fold) Confusion Matrix 
+# 
+# (entries are percentages of table totals)
+#  
+#           Reference
+# Prediction    A    B    C    D    E
+#          A 28.4  0.0  0.0  0.0  0.0
+#          B  0.0 19.3  0.0  0.0  0.0
+#          C  0.0  0.0 17.4  0.0  0.0
+#          D  0.0  0.0  0.0 16.4  0.0
+#          E  0.0  0.0  0.0  0.0 18.4
+# Resampling results across tuning parameters:
+# 
+#   mtry  Accuracy   Kappa      Accuracy SD   Kappa SD   
+#    5    0.9985729  0.9981949  0.0011965415  0.001513572
+#   10    0.9992865  0.9990975  0.0008040664  0.001017073
+      
+
+```
+
+```{r nb, cache=TRUE}
+
+set.seed(20160323)
+mdl_nb <- train(form=classe~.,
+                data=train.df%>%select_(.dots=del_nzv_cols),
+                method="nb",
+                trControl=train_control)
+
+# Cross-Validated (10 fold) Confusion Matrix 
+# 
+# (entries are percentages of table totals)
+#  
+#           Reference
+# Prediction    A    B    C    D    E
+#          A 29.9  2.8  0.0  0.0  0.0
+#          B  0.0 16.9  1.9  0.0  0.0
+#          C  0.0  0.2 17.1  2.3  0.0
+#          D  0.0  0.0  0.3 10.8  0.2
+#          E  0.0  0.0  0.0  0.1 17.4
+#   usekernel  Accuracy   Kappa      Accuracy SD  Kappa SD  
+#   FALSE            NaN        NaN          NA           NA
+#    TRUE      0.9218957  0.8999724  0.01091719   0.01401902
+
+
+```
+
+Some of the models provide model-specific diagnostics.
+Naive Bayes provides diagnostic plots in the form of conditional densities
+by classifier value.
+The plot for raw_timestamp_part_1 was very instructive in showing that the training data uniquely identifies
+the classe given raw_timestamp_part_1; the chart below shows the density plots for each
+user_name value with the test data timestamp values indicated by the verticle black lines:
+
+```{r timestamp_densities, fig.width=9}
+ggplot(train.df,aes(raw_timestamp_part_1,color=classe,fill=classe))+
+  geom_density(alpha=0.5)+
+  facet_wrap(~user_name,scales = "free_x")+
+  geom_vline(data=test.df,mapping = aes(xintercept=raw_timestamp_part_1))+
+  labs(title="Timestamp densities by user_name and classe\nwith test data values indicated")
+  
+```
+
+Non-linear models such as those based on trees (rpart, ctree, random forest) or on conditional probabilities
+(naive bayes) are capable of leveraging the relationship between raw_timestamp_part_1 and classe.
+
+
+## Model Selection
+
+Caret provides functions that can use paired statistical tests on the model outputs to determine which
+models performed differently at statistically significant levels.
+
+The primary function for this, caret::resample(), takes a list of models generated by caret::train()
+and uses the results of the resampling to derive statistics on accuracy and Kappa (for classification).
+If the same resampling approach is used for all the training (10-fold cross-validation in this case),
+then paired tests are used to determine, for the evaluation of each pair of models, the level of
+statisical significance (via a p-value).
+
+```{r resample_evaluation}
+
+model_list <- list()
+model_list <- c(model_list,list("PenalizedLDA"=mdl_plda))
+model_list <- c(model_list,list("pls"=mdl_pls))
+model_list <- c(model_list,list("rpart"=mdl_rpart))
+model_list <- c(model_list,list("lda"=mdl_lda))
+model_list <- c(model_list,list(knn=mdl_knn))
+model_list <- c(model_list,list(rf=mdl_rf))
+model_list <- c(model_list,list(nb=mdl_nb))
+
+resamp <- resamples(model_list)
+options(digits=4,width=500)
+summary(resamp)
+options(digits=10)
+
+```
+
+Here is table showing the difference in performance metric values and the p-value of the pairwise
+comparison of model performance (the null hypothesis is no difference).
+
+```{r significance}
+modelDifferences <- diff(resamp)
+options(digits=4, width=500)
+summary(modelDifferences)
+options(digits=10)
+
+```
+
+Random forest (rf) does perform best, and is statistically different from the others.
+
+# Predictions
+
+Here are the predictions for the provided test data using the most accurate model, random forest (rf):
+
+```{r predictions}
+
+pred_test_rf <- predict(mdl_rf,newdata=test.df)
+options(width=40)
+#knitr::kable(data.frame(rownum=1:nrow(test.df),prediction=pred_test_rf))
+print(data.frame(rownum=1:nrow(test.df),prediction=pred_test_rf),row.names=FALSE)
+
+```
+
+# Further Research
+Other directions of research to continue from this include:
+
+* Eliminate the use of variables, such as raw_timestamp_part_1, that are specific to a particular instance
+of performing the movement.
+Some of the models did well without relying on raw_timestamp_part_1 (but the best performing models did
+rely on it).
+
+* Predict from data collected separately from those used for training. It is clear that the testing set
+provided was sampled from the training set.
+
+
